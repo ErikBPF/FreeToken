@@ -44,21 +44,42 @@ def fused_topk(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    from freetoken.kernel.backend import is_triton_kernels_installed
+    from freetoken.kernel.backend import is_rocm_runtime, is_triton_kernels_installed
 
-    # triton_kernels ships no Windows wheel, and unlike flashinfer/sgl_kernel it is not one
-    # of the six ops the in-repo triton kernels cover -- so this router needs its own fallback.
+    # The in-tree HIP router is independently parity-tested and has passed the
+    # end-to-end Qwen quality control at least as fast as the matching
+    # ROCm llama.cpp control.  Make it the native ROCm default.  An operator can
+    # still set this to ``0`` to reproduce the PyTorch reference route during a
+    # diagnosis without changing model weights or server configuration.
+    use_rocm_triton_router = is_rocm_runtime() and os.environ.get(
+        "FREETOKEN_ROCM_TRITON_ROUTER", "1"
+    ) == "1"
+    if use_rocm_triton_router:
+        from freetoken.kernel.triton.moe_router import fused_topk_softmax
+
+        return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
+
+    # OpenAI's triton_kernels package distributes CUDA-only binaries. The
+    # in-tree Triton router is useful for research on HIP, but it changed a
+    # deterministic Qwen AIME output on the reference AMD machine despite matching router values
+    # in isolation. Production ROCm therefore retains this exact PyTorch route
+    # until an end-to-end quality-equivalent replacement is demonstrated.
     if not is_triton_kernels_installed():
         global _warned_torch_topk
         if not _warned_torch_topk:
             _warned_torch_topk = True
-            # Once, not per call: this runs every MoE forward. On Linux a missing
-            # triton_kernels used to fail fast with ImportError; keep the misconfiguration
-            # visible without giving up the fallback that Windows needs.
+            # Once, not per call: this runs every MoE forward. ROCm has no
+            # supported triton_kernels package, while CUDA Linux may restore
+            # the optimized package by installing it. Keep the distinction
+            # explicit so an AMD operator is not told to install CUDA binaries.
+            reason = (
+                "ROCm keeps the reference pure-torch router"
+                if is_rocm_runtime()
+                else "triton_kernels is not installed"
+            )
             logger.warning_rank0(
-                "fused_topk: triton_kernels is not installed -> pure-torch router fallback "
-                "(numerically equivalent, slower). Expected on Windows (no wheel); on Linux "
-                "install triton_kernels to restore the fused router."
+                f"fused_topk: {reason} -> pure-torch router fallback "
+                "(numerically equivalent, slower)."
             )
         return _torch_fused_topk(gating_output, topk, renormalize, num_token_non_padded)
 

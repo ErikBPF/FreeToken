@@ -75,13 +75,14 @@ def _setup():
     return pool, cm, tm, dm, pm, sent, stub
 
 
-def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None):
+def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None, output_len=4):
     """A launched (forward in flight) hybrid req: handle locked, pages allocated,
     GDN slots held, cached_len advanced -- the state _process_last_data will drain."""
     mr = cm.match_req(SimpleNamespace(input_ids=prompt, input_len=len(prompt),
                                       mm_embeds=None))
-    req = cls(input_ids=prompt, table_idx=tm.allocate(), cached_len=0, output_len=4,
-              uid=UID, sampling_params=SamplingParams(max_tokens=4),
+    req = cls(input_ids=prompt, table_idx=tm.allocate(), cached_len=0,
+              output_len=output_len, uid=UID,
+              sampling_params=SamplingParams(max_tokens=output_len),
               cache_handle=mr.cuda_handle)
     req.linear_slot_idx = pool.alloc(1)[0]
     req.mamba_ping_pong = tuple(pool.alloc(2))
@@ -222,3 +223,20 @@ def test_post_terminal_overlap_step_is_dropped():
     assert [m for m in sent if isinstance(m, DetokenizeMsg)] == terminal  # no 2nd msg
     assert req.output_len == output_len_before                           # no append
     cm.check_integrity()
+
+
+def test_output_budget_ignores_the_next_inflight_overlap_step():
+    """A launched next step must not make the previously sampled token terminal."""
+    from freetoken.message import DetokenizeMsg
+
+    pool, cm, tm, dm, _pm, sent, stub = _setup()
+    prompt = torch.arange(1, 13, dtype=torch.int32)
+    req = _launch_req(pool, cm, tm, prompt, output_len=2)
+    dm.filter_reqs([req])
+    req.complete_one()  # overlap launched token 2 before token 1 drained
+
+    Scheduler._process_last_data(stub, _as_last_data(Batch(reqs=[req], phase="prefill")))
+
+    reply = next(msg for msg in sent if isinstance(msg, DetokenizeMsg))
+    assert not reply.finished
+    assert req.input_ids.numel() == prompt.numel() + 1

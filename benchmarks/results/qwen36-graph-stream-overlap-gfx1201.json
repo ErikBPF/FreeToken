@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "scope": "Qwen3.6 shared-expert/copy overlap microbenchmark",
+  "source_commit": "1602c7987769a6eb3d7bf3e9865dca5feb7cfae8",
+  "command": "python3 scripts/bench_qwen36_graph_stream_overlap.py --phase shared --warmup 5 --samples 7 --replays 20",
+  "environment": {
+    "ram_gb": 128,
+    "cpu": "AMD Ryzen 9 5950X",
+    "gpu": "AMD Radeon RX 9070 XT",
+    "gpu_memory_gb": 16,
+    "gpu_arch": "gfx1201",
+    "python": "3.12",
+    "torch": "2.11.0+rocm7.14.0",
+    "hip": "7.14.60850",
+    "rocm_sdk_root_override_required": true
+  },
+  "result": {
+    "misses": 2,
+    "top_k": 8,
+    "phase": "shared",
+    "copied_bytes": 3801088,
+    "graph_copy_verified": true,
+    "output_exact": true,
+    "samples": 7,
+    "replays_per_sample": 20,
+    "serial_ms_median": 0.2162794589996338,
+    "overlap_ms_median": 0.18238494396209717,
+    "overlap_speedup": 1.1858405321251764,
+    "overlap_improvement_percent": 15.671629286623107
+  },
+  "limitations": [
+    "This is a kernel/copy microbenchmark, not an endpoint token-throughput result.",
+    "The schema-v1 benchmark does not emit raw sample arrays, so its medians cannot be recomputed from this artifact."
+  ]
+}

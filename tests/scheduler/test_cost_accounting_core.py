@@ -18,6 +18,8 @@ from freetoken.core import SamplingParams
 from freetoken.message import (
     AbortBackendMsg,
     BatchTokenizerMsg,
+    CacheStatsBackendMsg,
+    CacheStatsResultMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
     PromptAdmittedMsg,
@@ -148,6 +150,32 @@ def test_scheduler_rejection_emits_error_but_no_admission():
     assert added == []
     assert len(sent) == 1 and isinstance(sent[0], ErrorReplyMsg)
     assert not any(isinstance(msg, PromptAdmittedMsg) for msg in sent)
+
+
+def test_cache_stats_exposes_routing_oracle():
+    cache = SimpleNamespace(
+        decode_miss_stats=lambda: {"miss_rate": 0.25},
+        decode_miss_stats_per_layer=lambda: {"per_layer": []},
+        decode_routing_stats=lambda: {"oracle_hit_at_slots": 0.9},
+    )
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.engine = SimpleNamespace(moe_offload_cache=cache)
+    sent = []
+    scheduler.send_result = sent.extend
+
+    Scheduler._process_one_msg(scheduler, CacheStatsBackendMsg(request_id="stats"))
+
+    assert sent == [
+        CacheStatsResultMsg(
+            request_id="stats",
+            stats={
+                "available": True,
+                "summary": {"miss_rate": 0.25},
+                "per_layer": {"per_layer": []},
+                "routing": {"oracle_hit_at_slots": 0.9},
+            },
+        )
+    ]
 
 
 def test_scheduler_always_emits_terminal_abort_ack_for_unknown_uid():

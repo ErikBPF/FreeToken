@@ -519,6 +519,30 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
     ]
 
 
+def test_graph_disabled_enables_requested_routing_histogram():
+    from types import SimpleNamespace
+
+    from freetoken.engine.graph import GraphRunner
+
+    cache = SimpleNamespace(collect_stats=True, collect_decode_freq=False)
+
+    GraphRunner(
+        stream=None,
+        device=torch.device("cpu"),
+        model=None,
+        attn_backend=None,
+        cuda_graph_bs=[],
+        cuda_graph_max_bs=None,
+        free_memory=0,
+        max_seq_len=1,
+        vocab_size=1,
+        dummy_req=None,
+        moe_offload_cache=cache,
+    )
+
+    assert cache.collect_decode_freq is True
+
+
 def test_nvfp4_materialize_keeps_bookkeeping_consistent_across_requests():
     """Regression: a full-layer prefill loads the layer's experts into slots [0, E).
     If that overwrite does not invalidate the previous owners' mappings, a later

@@ -22,6 +22,7 @@ from freetoken.models.gguf.dequant import (
     GGML_F32,
     GGML_NAME,
     GGML_Q4_0,
+    GGML_Q4_K,
     GGML_Q6_K,
     GGML_Q8_0,
     row_bytes,
@@ -32,9 +33,9 @@ from .base import BaseOP
 # ggml type groups for kernel dispatch (subset we build kernels for).
 _UNQUANTIZED = {GGML_F32, GGML_F16, GGML_BF16}
 # standard + k-quants: both an MMVQ (small-batch GEMV) and MMQ (large-batch) kernel exist.
-_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
+_MMVQ = {GGML_Q4_0, GGML_Q4_K, GGML_Q8_0, GGML_Q6_K}
+_MMQ = {GGML_Q4_0, GGML_Q4_K, GGML_Q8_0, GGML_Q6_K}
+_DEQUANT = {GGML_Q4_0, GGML_Q4_K, GGML_Q8_0, GGML_Q6_K}
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
@@ -86,6 +87,20 @@ class GGUFLinear(BaseOP):
         if self.bias is not None:
             out = out + self.bias
         return out
+
+    def forward_q8_0_with_q8(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self._quant_type == GGML_Q8_0 and x.shape[0] <= _MMVQ_SAFE
+        assert self.bias is None
+        from freetoken.kernel.gguf import ggml_mul_mat_vec_q8_0_with_q8
+
+        return ggml_mul_mat_vec_q8_0_with_q8(self.qweight, x, self.out_features)
+
+    def forward_q8_0_silu(self, gate_up: torch.Tensor) -> torch.Tensor:
+        assert self._quant_type == GGML_Q8_0 and gate_up.shape[0] <= _MMVQ_SAFE
+        assert self.bias is None
+        from freetoken.kernel.gguf import ggml_mul_mat_vec_q8_0_silu
+
+        return ggml_mul_mat_vec_q8_0_silu(self.qweight, gate_up, self.out_features)
 
 
 class GGUFEmbedding(BaseOP):

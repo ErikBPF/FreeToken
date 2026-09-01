@@ -45,6 +45,13 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),
+    # Qwen3.6-35B-A3B Q4_K_M GGUF: gate/up rows are Q4_K while down rows
+    # are Q5_K.  Both stay byte-exact and the two GGML kernels are called
+    # separately by the mixed-format fused MoE path.
+    "q4_k_q5_k": ("gate_up", "down"),
+    # Qwen Q4_K_M's three late Q6_K down projections.  This intentionally has
+    # one bank and is used only by a small auxiliary cache.
+    "q6_k_down": ("down",),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -90,6 +97,8 @@ _BANK_BYTES_PER_EXPERT = {
         + (H // 128) * fp8_block_scale_pad(H // 128, I // 128)
     ) * 2,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
+    "q4_k_q5_k": lambda H, I: 2 * I * (H // 256) * 144 + H * (I // 256) * 176,
+    "q6_k_down": lambda H, I: H * (I // 256) * 210,
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
@@ -266,6 +275,9 @@ class OffloadMoeCache:
         self.prefill_begin_event: torch.cuda.Event | None = None
         self.prefill_ready_events: list[torch.cuda.Event] = []
         self.prefill_release_events: list[torch.cuda.Event] = []
+        self.decode_copy_stream: torch.cuda.Stream | None = None
+        self.decode_copy_begin_events: list[torch.cuda.Event] = []
+        self.decode_copy_ready_events: list[torch.cuda.Event] = []
         self._prefill_buffer_layer: list[int | None] = [None, None]
         self._prefill_buffer_released: list[bool] = [True, True]
         self._prefill_buffer_has_release_event: list[bool] = [False, False]
@@ -985,8 +997,40 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
-    def copy_missing(self) -> None:
+    def copy_missing_qwen_overlap(self, layer_id: int) -> torch.cuda.Event:
+        """Copy Q4 gate/up, then overlap the Q5 down copy on one graph-safe stream."""
+        assert self.quant_format == "q4_k_q5_k" and len(self.banks) == 2
+        if self.decode_copy_stream is None:
+            self.decode_copy_stream = torch.cuda.Stream(device=self.device)
+            self.decode_copy_begin_events = [torch.cuda.Event() for _ in range(self.num_layers)]
+            self.decode_copy_ready_events = [torch.cuda.Event() for _ in range(self.num_layers)]
+        main = torch.cuda.current_stream(self.device)
+        self.copy_missing(bank_indices=(0,))
+        self.decode_copy_begin_events[layer_id].record(main)
+        with torch.cuda.stream(self.decode_copy_stream):
+            self.decode_copy_stream.wait_event(self.decode_copy_begin_events[layer_id])
+            self.copy_missing(bank_indices=(1,))
+            self.decode_copy_ready_events[layer_id].record(self.decode_copy_stream)
+        return self.decode_copy_ready_events[layer_id]
+
+    def copy_missing_qwen_shared_overlap(self, layer_id: int) -> torch.cuda.Event:
+        """Copy both Qwen banks while the main stream computes its shared expert."""
+        assert self.quant_format == "q4_k_q5_k" and len(self.banks) == 2
+        if self.decode_copy_stream is None:
+            self.decode_copy_stream = torch.cuda.Stream(device=self.device)
+            self.decode_copy_begin_events = [torch.cuda.Event() for _ in range(self.num_layers)]
+            self.decode_copy_ready_events = [torch.cuda.Event() for _ in range(self.num_layers)]
+        main = torch.cuda.current_stream(self.device)
+        self.decode_copy_begin_events[layer_id].record(main)
+        with torch.cuda.stream(self.decode_copy_stream):
+            self.decode_copy_stream.wait_event(self.decode_copy_begin_events[layer_id])
+            self.copy_missing()
+            self.decode_copy_ready_events[layer_id].record(self.decode_copy_stream)
+        return self.decode_copy_ready_events[layer_id]
+
+    def copy_missing(self, bank_indices: tuple[int, ...] | None = None) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
+        banks = self.banks if bank_indices is None else tuple(self.banks[i] for i in bank_indices)
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
         if layer_id in self._unpinned_layers:
@@ -998,10 +1042,15 @@ class OffloadMoeCache:
                 )
             # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id -- a plain synchronous pageable H2D copy
             # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
-            for per_layer, cache in self.banks:
+            for per_layer, cache in banks:
                 cache[: self.num_experts].copy_(per_layer[layer_id])
             return
-        if self._copy_fused_ok:
+        # HIP graphs do not reliably retain the pinned-host mappings hidden behind the
+        # fused kernel's device-side pointer table. Direct per-bank tensor arguments do.
+        use_fused = bank_indices is None and self._copy_fused_ok and not (
+            torch.version.hip and torch.cuda.is_current_stream_capturing()
+        )
+        if use_fused:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
             # One launch copies the missing rows for every bank (instead of one launch per
@@ -1020,7 +1069,7 @@ class OffloadMoeCache:
 
         from freetoken.kernel import fast_index_copy_jit
 
-        for per_layer, cache in self.banks:
+        for per_layer, cache in banks:
             fast_index_copy_jit(
                 cache,
                 self.evict_slots,

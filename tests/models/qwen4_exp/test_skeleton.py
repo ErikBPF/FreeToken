@@ -375,7 +375,7 @@ class _StubLinearMixer(BaseOP):
 
 
 @requires_cuda
-def test_shared_expert_gate_fusion_matches_eager():
+def test_shared_expert_gate_fusion_matches_eager(monkeypatch):
     """Qwen4ExpMoE only swaps qwen3_5's gemv+sigmoid+mul+add gate chain for two triton kernels."""
     from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
     from freetoken.models.qwen4_exp.moe import Qwen4ExpMoE
@@ -388,6 +388,10 @@ def test_shared_expert_gate_fusion_matches_eager():
         moe = Qwen4ExpMoE(config, 0)
     _fill(moe, torch.Generator(device=device).manual_seed(21), scale=0.2)
     _fresh_ctx(moe_backend=FusedMoe())
+    monkeypatch.setattr(
+        "freetoken.models.qwen3_5_moe.moe.get_global_ctx",
+        lambda: SimpleNamespace(batch=SimpleNamespace(is_prefill=False, size=1)),
+    )
 
     x = torch.randn(6, config.hidden_size, device=device, dtype=dtype) * 0.5
     fused = moe.forward(x.clone())
