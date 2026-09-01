@@ -5,6 +5,8 @@
 #include <cuda_runtime.h>
 #include <torch/all.h>
 
+#include <tuple>
+
 // dont use clang-format here, it breaks the include order
 // clang-format off
 #include "dispatch.h"
@@ -19,7 +21,7 @@
 // clang-format off
 
 // Q8 gemv
-template <typename scalar_t>
+template <typename scalar_t, bool FusedSilu = false>
 static __global__ void
 quantize_q8_1(const scalar_t* __restrict__ x, void* __restrict__ vy, const int kx, const int kx_padded) {
   const auto ix = blockDim.x * blockIdx.x + threadIdx.x;
@@ -34,7 +36,17 @@ quantize_q8_1(const scalar_t* __restrict__ x, void* __restrict__ vy, const int k
   const int ib = i_padded / QK8_1;   // block index
   const int iqs = i_padded % QK8_1;  // quant index
 
-  const float xi = ix < kx ? static_cast<float>(x[iy * kx + ix]) : 0.0f;
+  float xi = 0.0f;
+  if (ix < kx) {
+    if constexpr (FusedSilu) {
+      const float gate = static_cast<float>(x[iy * 2 * kx + ix]);
+      const float up = static_cast<float>(x[iy * 2 * kx + kx + ix]);
+      const scalar_t rounded = static_cast<scalar_t>(gate / (1.0f + exp2f(-gate * 1.4426950408889634f)) * up);
+      xi = static_cast<float>(rounded);
+    } else {
+      xi = static_cast<float>(x[iy * kx + ix]);
+    }
+  }
   float amax = fabsf(xi);
   float sum = xi;
 
@@ -55,6 +67,21 @@ quantize_q8_1(const scalar_t* __restrict__ x, void* __restrict__ vy, const int k
 
   y[ib].ds.x = __float2half(d);
   y[ib].ds.y = __float2half(sum);
+}
+
+template <typename scalar_t>
+static void quantize_silu_row_q8_1_cuda(
+    const scalar_t* x, void* vy, const int kx, const int ky, cudaStream_t stream) {
+  const int64_t kx_padded = (kx + 512 - 1) / 512 * 512;
+  const int block_num_x = (kx_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+  constexpr int MAX_BLOCK_SIZE = 65535;
+  for (int off = 0; off < ky; off += MAX_BLOCK_SIZE) {
+    const int num_blocks_y = std::min(ky, off + MAX_BLOCK_SIZE) - off;
+    const dim3 num_blocks(block_num_x, num_blocks_y, 1);
+    const dim3 block_size(CUDA_DEQUANTIZE_BLOCK_SIZE, 1, 1);
+    quantize_q8_1<scalar_t, true><<<num_blocks, block_size, 0, stream>>>(
+        &x[off * 2 * kx], (int32_t*)vy + off * (kx_padded / 32 * 9), kx, kx_padded);
+  }
 }
 
 template <typename scalar_t>
@@ -184,7 +211,84 @@ torch::Tensor ggml_mul_mat_vec_a8(
         mul_mat_vec_iq1_m_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
         break;
+      default:
+        TORCH_CHECK(false, "unsupported GGUF quant type: ", type);
     }
+  });
+  return Y;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> ggml_mul_mat_vec_q8_0_with_q8(
+    torch::Tensor W,
+    torch::Tensor X,
+    int64_t row) {
+  const int col = X.sizes()[1];
+  const int vecs = X.sizes()[0];
+  const int padded = (col + 512 - 1) / 512 * 512;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
+  at::Tensor Y = torch::empty({vecs, row}, options);
+  options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
+  at::Tensor quant_X = torch::empty({vecs, padded / 32 * 9}, options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_mul_mat_vec_q8_0_with_q8", [&] {
+    quantize_row_q8_1_cuda<scalar_t>(
+        (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
+    mul_mat_vec_q8_0_q8_1_cuda<scalar_t>(
+        (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
+        col, row, vecs, stream);
+  });
+  return {Y, quant_X};
+}
+
+torch::Tensor ggml_mul_mat_vec_q8_0_silu(
+    torch::Tensor W,
+    torch::Tensor X,
+    int64_t row) {
+  const int col = X.sizes()[1] / 2;
+  const int vecs = X.sizes()[0];
+  const int padded = (col + 512 - 1) / 512 * 512;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
+  at::Tensor Y = torch::empty({vecs, row}, options);
+  options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
+  at::Tensor quant_X = torch::empty({vecs, padded / 32 * 9}, options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_mul_mat_vec_q8_0_silu", [&] {
+    quantize_silu_row_q8_1_cuda<scalar_t>(
+        (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
+    mul_mat_vec_q8_0_q8_1_cuda<scalar_t>(
+        (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
+        col, row, vecs, stream);
+  });
+  return Y;
+}
+
+torch::Tensor ggml_moe_a8_vec_q8(
+    torch::Tensor X,
+    torch::Tensor quant_X,
+    torch::Tensor W,
+    torch::Tensor topk_ids,
+    int64_t top_k,
+    int64_t row,
+    int64_t tokens) {
+  const int col = X.sizes()[1];
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
+  at::Tensor Y = torch::empty({tokens * top_k, row}, options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_a8_vec_q8", [&] {
+    moe_vec_q4_K_q8_1_cuda<scalar_t>(
+        (void*)W.data_ptr(),
+        (void*)quant_X.data_ptr(),
+        (scalar_t*)Y.data_ptr(),
+        (int*)topk_ids.data_ptr(),
+        top_k,
+        tokens,
+        col,
+        row,
+        quant_X.stride(0),
+        stream);
   });
   return Y;
 }
@@ -327,6 +431,8 @@ torch::Tensor ggml_mul_mat_a8(
             row,
             stream);
         break;
+      default:
+        TORCH_CHECK(false, "unsupported GGUF quant type: ", type);
     }
   });
   return Y;
@@ -533,6 +639,8 @@ torch::Tensor ggml_moe_a8(
             sorted_token_ids.sizes()[0],
             stream);
         break;
+      default:
+        TORCH_CHECK(false, "unsupported GGUF quant type: ", type);
     }
   });
   return Y;
@@ -550,7 +658,7 @@ torch::Tensor ggml_moe_a8_vec(
   const int padded = (col + 512 - 1) / 512 * 512;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
-  at::Tensor Y = torch::zeros({tokens * top_k, row}, options);
+  at::Tensor Y = torch::empty({tokens * top_k, row}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
   at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
@@ -804,6 +912,102 @@ torch::Tensor ggml_moe_a8_vec(
             quant_X.stride(0),
             stream);
         break;
+      default:
+        TORCH_CHECK(false, "unsupported GGUF quant type: ", type);
+    }
+  });
+  return Y;
+}
+
+torch::Tensor ggml_moe_a8_vec_silu(
+    torch::Tensor X,  // unactivated [gate, up]
+    torch::Tensor W,
+    torch::Tensor topk_ids,
+    int64_t type,
+    int64_t row) {
+  TORCH_CHECK(type == 13 || type == 14, "fused silu GGUF down projection requires Q5_K or Q6_K");
+  const int tokens = X.sizes()[0];
+  const int col = X.sizes()[1] / 2;
+  const int padded = (col + 512 - 1) / 512 * 512;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
+  at::Tensor Y = torch::empty({tokens, row}, options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
+  at::Tensor quant_X = torch::empty({tokens, padded / 32 * 9}, options);
+  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_a8_silu", [&] {
+    quantize_silu_row_q8_1_cuda<scalar_t>(
+        (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
+    if (type == 13) {
+      moe_vec_q5_K_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(),
+          (void*)quant_X.data_ptr(),
+          (scalar_t*)Y.data_ptr(),
+          (int*)topk_ids.data_ptr(),
+          1,
+          tokens,
+          col,
+          row,
+          quant_X.stride(0),
+          stream);
+    } else {
+      moe_vec_q6_K_q8_1_cuda<scalar_t>(
+          (void*)W.data_ptr(),
+          (void*)quant_X.data_ptr(),
+          (scalar_t*)Y.data_ptr(),
+          (int*)topk_ids.data_ptr(),
+          1,
+          tokens,
+          col,
+          row,
+          quant_X.stride(0),
+          stream);
+    }
+  });
+  return Y;
+}
+
+torch::Tensor ggml_moe_a8_vec_silu_reduce(
+    torch::Tensor X,
+    torch::Tensor W,
+    torch::Tensor topk_ids,
+    torch::Tensor topk_weights,
+    int64_t type,
+    int64_t row,
+    std::optional<torch::Tensor> residual,
+    std::optional<torch::Tensor> residual_gate) {
+  TORCH_CHECK(type == 13 || type == 14, "fused silu reduction requires Q5_K or Q6_K");
+  const int tokens = topk_ids.sizes()[0];
+  const int top_k = topk_ids.sizes()[1];
+  TORCH_CHECK(top_k <= 32 && X.sizes()[0] == tokens * top_k, "invalid routed activation shape");
+  TORCH_CHECK(topk_weights.scalar_type() == torch::kFloat32, "route weights must be float32");
+  const int col = X.sizes()[1] / 2;
+  const int padded = (col + 512 - 1) / 512 * 512;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
+  at::Tensor Y = torch::empty({tokens, row}, options);
+  options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
+  at::Tensor quant_X = torch::empty({tokens * top_k, padded / 32 * 9}, options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_a8_silu_reduce", [&] {
+    const scalar_t* residual_ptr = residual.has_value()
+        ? (const scalar_t*)residual.value().data_ptr() : nullptr;
+    const scalar_t* residual_gate_ptr = residual_gate.has_value()
+        ? (const scalar_t*)residual_gate.value().data_ptr() : nullptr;
+    quantize_silu_row_q8_1_cuda<scalar_t>(
+        (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens * top_k, stream);
+    if (type == 13) {
+      moe_vec_q5_K_q8_1_reduce_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
+          (int*)topk_ids.data_ptr(), (float*)topk_weights.data_ptr(), residual_ptr,
+          residual_gate_ptr, top_k, tokens,
+          col, row, quant_X.stride(0), stream);
+    } else {
+      moe_vec_q6_K_q8_1_reduce_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
+          (int*)topk_ids.data_ptr(), (float*)topk_weights.data_ptr(), residual_ptr,
+          residual_gate_ptr, top_k, tokens,
+          col, row, quant_X.stride(0), stream);
     }
   });
   return Y;
@@ -831,6 +1035,8 @@ int64_t ggml_moe_get_block_size(int64_t type) {
       return MOE_X_Q5_K;
     case 14:
       return MOE_X_Q6_K;
+    default:
+      TORCH_CHECK(false, "unsupported GGUF quant type: ", type);
   }
   return 0;
 }
@@ -841,8 +1047,13 @@ int64_t ggml_moe_get_block_size(int64_t type) {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ggml_dequantize", &ggml_dequantize, "");
   m.def("ggml_mul_mat_vec_a8", &ggml_mul_mat_vec_a8, "");
+  m.def("ggml_mul_mat_vec_q8_0_with_q8", &ggml_mul_mat_vec_q8_0_with_q8, "");
+  m.def("ggml_mul_mat_vec_q8_0_silu", &ggml_mul_mat_vec_q8_0_silu, "");
   m.def("ggml_mul_mat_a8", &ggml_mul_mat_a8, "");
   m.def("ggml_moe_a8", &ggml_moe_a8, "");
   m.def("ggml_moe_a8_vec", &ggml_moe_a8_vec, "");
+  m.def("ggml_moe_a8_vec_q8", &ggml_moe_a8_vec_q8, "");
+  m.def("ggml_moe_a8_vec_silu", &ggml_moe_a8_vec_silu, "");
+  m.def("ggml_moe_a8_vec_silu_reduce", &ggml_moe_a8_vec_silu_reduce, "");
   m.def("ggml_moe_get_block_size", &ggml_moe_get_block_size, "");
 }

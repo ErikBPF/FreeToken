@@ -25,6 +25,8 @@ def _pdl_supported() -> bool:
 
 def _reduction_warps(hidden_dim: int, num_tokens: int) -> int:
     warps = max(min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), 32), 4)
+    if torch.version.hip is not None and num_tokens == 1:
+        return 2
     return min(warps, 8) if num_tokens >= 1024 else warps
 
 

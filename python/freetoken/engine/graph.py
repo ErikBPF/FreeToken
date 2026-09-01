@@ -116,6 +116,10 @@ class GraphRunner:
         self.graph_bs_list = sorted(cuda_graph_bs)
         self.dummy_req = dummy_req
         self.moe_offload_cache = moe_offload_cache
+        if moe_offload_cache is not None:
+            moe_offload_cache.collect_decode_freq = (
+                getattr(moe_offload_cache, "collect_stats", False) and self.max_graph_bs == 0
+            )
         self.stream = stream
         self.device = device
         self._capture_graphs(max_seq_len, vocab_size, model)

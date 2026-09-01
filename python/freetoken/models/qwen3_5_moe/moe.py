@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from freetoken.core import get_global_ctx
 from freetoken.layers import (
     BaseOP,
     LinearColParallelMerged,
@@ -44,6 +45,17 @@ class _SharedExpert(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
 
+    def forward_q8_0_with_q8(
+        self, x: torch.Tensor, *, fused_silu: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        gate_up, q8 = self.gate_up_proj.forward_q8_0_with_q8(x)
+        shared = (
+            self.down_proj.forward_q8_0_silu(gate_up)
+            if fused_silu
+            else self.down_proj.forward(silu_and_mul(gate_up))
+        )
+        return shared, q8
+
 
 class Qwen3_5DenseMLP(_SharedExpert):
     """Dense (non-MoE) SwiGLU MLP for dense Qwen3.x checkpoints (e.g. 27B): ``gate_up_proj``
@@ -80,16 +92,74 @@ class Qwen3_5MoE(BaseOP):
         )
         self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
 
+    def _router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch = get_global_ctx().batch
+        if batch.is_prefill and batch.size > 1:
+            lengths = [req.extend_len for req in batch.reqs]
+            return torch.cat([self.gate.forward(x) for x in hidden_states.split(lengths)])
+        return self.gate.forward(hidden_states)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # Compute the router + shared expert BEFORE the routed experts: the fused MoE
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
-        router_logits = self.gate.forward(hidden_states)
-        shared = self.shared_expert.forward(hidden_states)
-        shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
-        routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        from freetoken.moe.fused_q4_k_q5_k import QWEN_GGUF_FUSION_LEVEL
+
+        reuse_q8 = (
+            QWEN_GGUF_FUSION_LEVEL >= 1
+            and hidden_states.shape[0] <= 6
+            and hasattr(self.shared_expert.gate_up_proj, "forward_q8_0_with_q8")
+        )
+        router_logits = self._router_logits(hidden_states)
+        prepared = (
+            self.experts.prepare_qwen_decode_overlap(hidden_states, router_logits)
+            if hasattr(self.experts, "prepare_qwen_decode_overlap")
+            else None
+        )
+        if reuse_q8:
+            shared, hidden_q8 = self.shared_expert.forward_q8_0_with_q8(
+                hidden_states, fused_silu=QWEN_GGUF_FUSION_LEVEL >= 2
+            )
+        else:
+            shared = self.shared_expert.forward(hidden_states)
+            hidden_q8 = None
+        if hidden_q8 is None:
+            shared_gate = torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
+            shared = shared * shared_gate
+        else:
+            from freetoken.kernel.triton.moe_shared_gate import shared_gate_sigmoid
+
+            shared_gate = shared_gate_sigmoid(
+                hidden_states, self.shared_expert_gate.weight.view(-1)
+            ).to(hidden_states.dtype)
+        if prepared is not None:
+            fuse_shared = hidden_states.shape[0] == 1 and QWEN_GGUF_FUSION_LEVEL >= 3
+            routed = self.experts.decode_qwen_prepared(
+                prepared,
+                hidden_states,
+                hidden_q8=hidden_q8,
+                residual=shared if fuse_shared else None,
+                residual_gate=shared_gate.view(-1) if fuse_shared else None,
+            )
+            if fuse_shared:
+                return routed.view(num_tokens, hidden_dim)
+            shared = shared * shared_gate[:, None]
+        elif hidden_q8 is None:
+            routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        else:
+            fuse_shared = hidden_states.shape[0] == 1 and QWEN_GGUF_FUSION_LEVEL >= 3
+            routed = self.experts.forward(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                hidden_q8=hidden_q8,
+                residual=shared if fuse_shared else None,
+                residual_gate=shared_gate.view(-1) if fuse_shared else None,
+            )
+            if fuse_shared:
+                return routed.view(num_tokens, hidden_dim)
+            shared = shared * shared_gate[:, None]
         return (routed + shared).view(num_tokens, hidden_dim)
 
 

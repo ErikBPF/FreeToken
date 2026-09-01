@@ -2,6 +2,34 @@ import pytest
 import torch
 
 
+def test_fused_topk_keeps_reference_router_on_rocm(monkeypatch):
+    """HIP retains the exact PyTorch router until end-to-end parity is proven."""
+    from freetoken.kernel import backend
+    from freetoken.moe import fused
+
+    weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
+    ids = torch.tensor([[4, 9]], dtype=torch.int32)
+    calls = []
+
+    monkeypatch.setattr(backend, "is_rocm_runtime", lambda: True)
+    monkeypatch.setattr(
+        fused,
+        "_torch_fused_topk",
+        lambda logits, topk, renormalize, limit: (
+            calls.append((logits, topk, renormalize, limit)) or (weights, ids)
+        ),
+    )
+
+    got_weights, got_ids = fused.fused_topk(
+        torch.empty((1, 3)), torch.empty((1, 16)), topk=2, renormalize=True
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1:] == (2, True, None)
+    assert got_weights is weights
+    assert got_ids is ids
+
+
 def _activation_and_mul(gate_up: torch.Tensor, activation: str) -> torch.Tensor:
     gate, up = gate_up.chunk(2, dim=-1)
     if activation == "silu":

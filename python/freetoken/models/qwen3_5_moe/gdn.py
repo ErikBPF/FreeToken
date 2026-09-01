@@ -77,13 +77,24 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self._block_fp8 = expert_quant == "fp8_block"
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
         self._fp8 = self._block_fp8 or self._pertensor_fp8
+        # GGUF Qwen stores qkv|z as Q8_0 but recurrence b|a as F32.  It shares the
+        # split-projection dataflow with FP8 without pretending that Q8_0 is FP8.
+        self._gguf_q8 = attn_quant == "gguf_q8"
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
-        if self._fp8:
-            ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
-            self.in_proj_qkvz = ColMerged(
-                hidden_size, [self.conv_dim, self.value_dim], has_bias=False
-            )
+        if self._fp8 or self._gguf_q8:
+            if self._gguf_q8:
+                from freetoken.layers.gguf import GGUFLinear
+                from freetoken.models.gguf.dequant import GGML_Q8_0
+
+                self.in_proj_qkvz = GGUFLinear(
+                    hidden_size, self.conv_dim + self.value_dim, GGML_Q8_0, has_bias=False
+                )
+            else:
+                ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
+                self.in_proj_qkvz = ColMerged(
+                    hidden_size, [self.conv_dim, self.value_dim], has_bias=False
+                )
             self.in_proj_ba = LinearColParallelMerged(
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False
             )
@@ -112,6 +123,13 @@ class Qwen3_5GatedDeltaNet(BaseOP):
 
     def _conv_weight(self) -> torch.Tensor:
         return self.conv1d.weight.squeeze(1)  # [conv_dim, kernel] for the fused kernel
+
+    def _project_ba(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch = get_global_ctx().batch
+        if batch.is_prefill and batch.size > 1:
+            lengths = [req.extend_len for req in batch.reqs]
+            return torch.cat([self.in_proj_ba.forward(x) for x in hidden_states.split(lengths)])
+        return self.in_proj_ba.forward(hidden_states)
 
     def _conv_prefill(self, conv_in, pool, cu_seqlens, cache_indices, has_initial_state) -> torch.Tensor:
         """Varlen causal conv (fused sgl_kernel) with silu; reads/updates each request's
@@ -161,10 +179,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
-        if self._fp8:
+        if self._fp8 or self._gguf_q8:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
-            ba = self.in_proj_ba.forward(hidden_states)
+            ba = self._project_ba(hidden_states)
             b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
         else:
             proj = self.in_proj.forward(hidden_states)

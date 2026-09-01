@@ -51,6 +51,114 @@ static __global__ void moe_vec_q(
   }
 }
 
+template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t vec_dot_q_cuda>
+static __global__ void moe_vec_q_reduce(
+    const void* __restrict__ vx,
+    const void* __restrict__ vy,
+    scalar_t* __restrict__ dst,
+    const int* __restrict__ topk_ids,
+    const float* __restrict__ topk_weights,
+    const scalar_t* __restrict__ residual,
+    const scalar_t* __restrict__ residual_gate,
+    const int topk,
+    const int ncols,
+    const int nrows,
+    const int token_stride) {
+  const int row = blockIdx.x;
+  const int token = blockIdx.z;
+  const int route = threadIdx.y;
+  const int expert = topk_ids[token * topk + route];
+  const int blocks_per_row = ncols / qk;
+  const int blocks_per_warp = vdr * WARP_SIZE / qi;
+  const block_q_t* x = ((const block_q_t*)vx) + expert * nrows * blocks_per_row;
+  const block_q8_1* y = (const block_q8_1*)(
+      ((const int*)vy) + (token * topk + route) * token_stride);
+
+  float tmp = 0.0f;
+  for (int i = threadIdx.x / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
+    const int iby = i * (qk / QK8_1);
+    const int iqs = vdr * (threadIdx.x % (qi / vdr));
+    tmp += vec_dot_q_cuda(&x[row * blocks_per_row + i], &y[iby], iqs);
+  }
+#pragma unroll
+  for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    tmp += SGLANG_SHFL_XOR_SYNC(uint32_t(-1), tmp, mask);
+  }
+
+  __shared__ scalar_t route_values[32];
+  if (threadIdx.x == 0) {
+    const scalar_t value = static_cast<scalar_t>(tmp);
+    const scalar_t weight = static_cast<scalar_t>(topk_weights[token * topk + route]);
+    route_values[route] = static_cast<scalar_t>(
+        static_cast<float>(value) * static_cast<float>(weight));
+  }
+  __syncthreads();
+  if (threadIdx.x == 0 && route == 0) {
+    float sum = 0.0f;
+    for (int i = 0; i < topk; ++i) {
+      sum += static_cast<float>(route_values[i]);
+    }
+    const scalar_t routed = static_cast<scalar_t>(sum);
+    if (residual == nullptr) {
+      dst[token * nrows + row] = routed;
+    } else {
+      float shared = static_cast<float>(residual[token * nrows + row]);
+      if (residual_gate != nullptr) {
+        shared = static_cast<float>(static_cast<scalar_t>(
+            shared * static_cast<float>(residual_gate[token])));
+      }
+      dst[token * nrows + row] = static_cast<scalar_t>(
+          static_cast<float>(routed) + shared);
+    }
+  }
+}
+
+template <typename scalar_t>
+static void moe_vec_q5_K_q8_1_reduce_cuda(
+    const void* vx, const void* vy, scalar_t* dst, const int* topk_ids,
+    const float* topk_weights, const scalar_t* residual, const scalar_t* residual_gate,
+    const int top_k, const int tokens,
+    const int ncols, const int nrows, const int token_stride, cudaStream_t stream) {
+  const dim3 block_nums(nrows, 1, tokens);
+  const dim3 block_dims(WARP_SIZE, top_k, 1);
+  moe_vec_q_reduce<scalar_t, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ,
+                   vec_dot_q5_K_q8_1><<<block_nums, block_dims, 0, stream>>>(
+      vx, vy, dst, topk_ids, topk_weights, residual, residual_gate,
+      top_k, ncols, nrows, token_stride);
+}
+
+template <typename scalar_t>
+static void moe_vec_q6_K_q8_1_reduce_cuda(
+    const void* vx, const void* vy, scalar_t* dst, const int* topk_ids,
+    const float* topk_weights, const scalar_t* residual, const scalar_t* residual_gate,
+    const int top_k, const int tokens,
+    const int ncols, const int nrows, const int token_stride, cudaStream_t stream) {
+  const dim3 block_nums(nrows, 1, tokens);
+  const dim3 block_dims(WARP_SIZE, top_k, 1);
+  moe_vec_q_reduce<scalar_t, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ,
+                   vec_dot_q6_K_q8_1><<<block_nums, block_dims, 0, stream>>>(
+      vx, vy, dst, topk_ids, topk_weights, residual, residual_gate,
+      top_k, ncols, nrows, token_stride);
+}
+
+#if defined(USE_ROCM)
+// The HIP launcher is defined after the CUDA-compatible wrapper so the
+// generic wrappers remain grouped by quantization format below.
+template <typename scalar_t>
+static void moe_vec_q4_0_q8_1_hip_two_rows_cuda(
+    const void* vx,
+    const void* vy,
+    scalar_t* dst,
+    const int* topk_ids,
+    const int top_k,
+    const int tokens,
+    const int ncols,
+    const int nrows,
+    const int token_stride,
+    cudaStream_t stream);
+#endif
+
 template <typename scalar_t>
 static void moe_vec_q4_0_q8_1_cuda(
     const void* vx,
@@ -63,12 +171,103 @@ static void moe_vec_q4_0_q8_1_cuda(
     const int nrows,
     const int token_stride,
     cudaStream_t stream) {
+#if defined(USE_ROCM)
+  // Route AMD builds through the one-wave/two-row specialization above.  CUDA
+  // retains the established generic implementation until it has independent
+  // NVIDIA evidence, so this HIP experiment cannot alter CUDA behavior.
+  moe_vec_q4_0_q8_1_hip_two_rows_cuda<scalar_t>(
+      vx, vy, dst, topk_ids, top_k, tokens, ncols, nrows, token_stride, stream);
+#else
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
   moe_vec_q<scalar_t, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>
       <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+#endif
 }
+
+#if defined(USE_ROCM)
+// HIP Q4_0 MoE specialization derived from the current llama.cpp MMVQ row
+// structure.  Unlike the older GGML_CUDA_MMV_Y=2 experiment, this launch uses
+// one 32-lane wave for two rows, rather than two independent waves.  The two
+// float accumulators share the same packed Q4_0 activation block and expert
+// selection, reducing grid work while preserving FreeToken's existing packed
+// bank layout, route indexing, and BF16 output contract.
+template <typename scalar_t>
+__launch_bounds__(WARP_SIZE, 1)
+static __global__ void moe_vec_q4_0_hip_two_rows(
+    const void* __restrict__ vx,
+    const void* __restrict__ vy,
+    scalar_t* __restrict__ dst,
+    const int* __restrict__ topk_ids,
+    const int topk,
+    const int ncols,
+    const int nrows,
+    const int token_stride) {
+  // X indexes adjacent pairs of output rows.  Y is the flattened
+  // token/top-k route index, matching the former Z dimension exactly.
+  const int row0 = 2 * blockIdx.x;
+  const int route = blockIdx.y;
+  if (row0 >= nrows) {
+    return;
+  }
+
+  const int token = route / topk;
+  const int expert = topk_ids[route];
+  const int blocks_per_row = ncols / QK4_0;
+  const int blocks_per_wave = VDR_Q4_0_Q8_1_MMVQ * WARP_SIZE / QI4_0;
+  const block_q4_0* x = ((const block_q4_0*)vx) + expert * nrows * blocks_per_row;
+  const block_q8_1* y = (const block_q8_1*)(((const int*)vy) + token * token_stride);
+
+  // Each lane owns the same packed-Q4 range for both rows.  Keeping the
+  // reductions separate preserves the original arithmetic for each result.
+  float tmp0 = 0.0f;
+  float tmp1 = 0.0f;
+  for (int i = threadIdx.x / (QI4_0 / VDR_Q4_0_Q8_1_MMVQ); i < blocks_per_row;
+       i += blocks_per_wave) {
+    const int iby = i * (QK4_0 / QK8_1);
+    const int iqs = VDR_Q4_0_Q8_1_MMVQ * (threadIdx.x % (QI4_0 / VDR_Q4_0_Q8_1_MMVQ));
+    tmp0 += vec_dot_q4_0_q8_1(&x[row0 * blocks_per_row + i], &y[iby], iqs);
+    if (row0 + 1 < nrows) {
+      tmp1 += vec_dot_q4_0_q8_1(&x[(row0 + 1) * blocks_per_row + i], &y[iby], iqs);
+    }
+  }
+
+  // A wave-level XOR reduction leaves the same sum in every lane.  Lane zero
+  // writes row zero and lane one writes row one, avoiding shared memory.
+#pragma unroll
+  for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+    tmp0 += SGLANG_SHFL_XOR_SYNC(uint32_t(-1), tmp0, mask);
+    tmp1 += SGLANG_SHFL_XOR_SYNC(uint32_t(-1), tmp1, mask);
+  }
+  if (threadIdx.x == 0) {
+    dst[route * nrows + row0] = tmp0;
+  }
+  if (threadIdx.x == 1 && row0 + 1 < nrows) {
+    dst[route * nrows + row0 + 1] = tmp1;
+  }
+}
+
+template <typename scalar_t>
+static void moe_vec_q4_0_q8_1_hip_two_rows_cuda(
+    const void* vx,
+    const void* vy,
+    scalar_t* dst,
+    const int* topk_ids,
+    const int top_k,
+    const int tokens,
+    const int ncols,
+    const int nrows,
+    const int token_stride,
+    cudaStream_t stream) {
+  // One block now covers two rows and one route.  ``tokens * top_k`` remains
+  // the complete flattened routing domain used by the original launcher.
+  const dim3 block_nums((nrows + 1) / 2, tokens * top_k, 1);
+  const dim3 block_dims(WARP_SIZE, 1, 1);
+  moe_vec_q4_0_hip_two_rows<scalar_t>
+      <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+}
+#endif
 
 template <typename scalar_t>
 static void moe_vec_q4_1_q8_1_cuda(
