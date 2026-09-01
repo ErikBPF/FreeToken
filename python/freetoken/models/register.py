@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib
+import os
 from dataclasses import dataclass
+from importlib import metadata
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -132,12 +134,52 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     ),
 }
 
+_MODEL_PROVIDER_GROUP = "freetoken.models"
+_MODEL_PROVIDER_ENV = "FREETOKEN_MODEL_PROVIDERS"
+
+
+def _external_model_specs(model_architecture: str):
+    return [
+        (entry_point, entry_point.dist.name)
+        for entry_point in metadata.entry_points(group=_MODEL_PROVIDER_GROUP)
+        if entry_point.name == model_architecture
+    ]
+
 
 def get_model_spec(model_architecture: str) -> ModelSpec:
-    try:
-        return _MODEL_REGISTRY[model_architecture]
-    except KeyError as exc:
-        raise ValueError(f"Model architecture {model_architecture} not supported") from exc
+    builtin = _MODEL_REGISTRY.get(model_architecture)
+    allowed = {
+        name.strip().casefold()
+        for name in os.getenv(_MODEL_PROVIDER_ENV, "").split(",")
+        if name.strip()
+    }
+    candidates = _external_model_specs(model_architecture) if allowed or builtin is None else []
+    selected = [item for item in candidates if item[1].casefold() in allowed]
+
+    if builtin is not None:
+        if selected:
+            raise ValueError(
+                f"External provider cannot replace built-in model architecture {model_architecture}"
+            )
+        return builtin
+
+    if not candidates:
+        raise ValueError(f"Model architecture {model_architecture} not supported")
+    if not selected:
+        installed = ", ".join(sorted(name for _, name in candidates))
+        raise ValueError(
+            f"External provider is installed but not allowed: {installed}; "
+            f"add its distribution name to {_MODEL_PROVIDER_ENV}"
+        )
+    if len(selected) > 1:
+        providers = ", ".join(sorted(name for _, name in selected))
+        raise ValueError(f"Model architecture has multiple allowed providers: {providers}")
+
+    entry_point, distribution = selected[0]
+    spec = entry_point.load()
+    if not isinstance(spec, ModelSpec):
+        raise TypeError(f"Provider {distribution} must export ModelSpec")
+    return spec
 
 
 def _load_attr(module_path: str, attr_name: str) -> Any:

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "freetoken-example-model-provider"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["freetoken"]
+
+[project.entry-points."freetoken.models"]
+ExampleLlamaForCausalLM = "freetoken_example_provider:MODEL_SPEC"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["freetoken_example_provider"]
